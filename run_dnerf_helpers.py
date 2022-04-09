@@ -140,7 +140,7 @@ class NeRF:
         return model
 
 class NeRFOriginal(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, input_ch_time=1, output_ch=4, skips=[4],
+    def __init__(self, aabb, gridSize, device, D=8, W=256, input_ch=3, input_ch_views=3, input_ch_time=1, output_ch=4, skips=[4],
                  use_viewdirs=False, memory=[], embed_fn=None, output_color_ch=3, zero_canonical=True):
         super(NeRFOriginal, self).__init__()
         # aabb, gridSize, device
@@ -224,8 +224,8 @@ class NeRFOriginal(nn.Module):
         sigma = validsigma
 
         #if app_mask.any():
-        #app_features = self.compute_appfeature(xyz_sampled)
-        #valid_rgbs = self.renderModule(xyz_sampled, viewdirs, app_features)
+        app_features = self.compute_appfeature(xyz_sampled)
+        valid_rgbs = self.renderModule(xyz_sampled, viewdirs, app_features) # TODO: ここでPEしてる
         #rgb = valid_rgbs
 
         # for i, l in enumerate(self.pts_linears):
@@ -282,7 +282,7 @@ class NeRFOriginal(nn.Module):
 
     # from TensoRF
     def normalize_coord(self, xyz_sampled):
-        return (xyz_sampled-self.aabb[0]) * self.invaabbSize - 1
+            return (xyz_sampled-self.aabb[0]) * self.invaabbSize - 1
 
     def feature2density(self, density_features):
         if self.fea2denseAct == "softplus":
@@ -290,29 +290,45 @@ class NeRFOriginal(nn.Module):
         elif self.fea2denseAct == "relu":
             return F.relu(density_features)
 
-    # from tensoRF.py VM
+    # from tensoRF.py VMSplit
     def compute_densityfeature(self, xyz_sampled):
+
+        # plane + line basis
         coordinate_plane = torch.stack((xyz_sampled[..., self.matMode[0]], xyz_sampled[..., self.matMode[1]], xyz_sampled[..., self.matMode[2]])).detach().view(3, -1, 1, 2)
         coordinate_line = torch.stack((xyz_sampled[..., self.vecMode[0]], xyz_sampled[..., self.vecMode[1]], xyz_sampled[..., self.vecMode[2]]))
         coordinate_line = torch.stack((torch.zeros_like(coordinate_line), coordinate_line), dim=-1).detach().view(3, -1, 1, 2)
 
-        plane_feats = F.grid_sample(self.plane_coef[:, -self.density_n_comp:], coordinate_plane, align_corners=True).view(
-                                        -1, *xyz_sampled.shape[:1])
-        line_feats = F.grid_sample(self.line_coef[:, -self.density_n_comp:], coordinate_line, align_corners=True).view(
-                                        -1, *xyz_sampled.shape[:1])
-        
-        sigma_feature = torch.sum(plane_feats * line_feats, dim=0)
-        
-        
+        sigma_feature = torch.zeros((xyz_sampled.shape[0],), device=xyz_sampled.device)
+        for idx_plane in range(len(self.density_plane)):
+            plane_coef_point = F.grid_sample(self.density_plane[idx_plane], coordinate_plane[[idx_plane]],
+                                                align_corners=True).view(-1, *xyz_sampled.shape[:1])
+            line_coef_point = F.grid_sample(self.density_line[idx_plane], coordinate_line[[idx_plane]],
+                                            align_corners=True).view(-1, *xyz_sampled.shape[:1])
+            sigma_feature = sigma_feature + torch.sum(plane_coef_point * line_coef_point, dim=0)
+
         return sigma_feature
 
     def init_svd_volume(self, res, device):
-        self.plane_coef = torch.nn.Parameter(
-            0.1 * torch.randn((3, self.app_n_comp + self.density_n_comp, res, res), device=device))
-        self.line_coef = torch.nn.Parameter(
-            0.1 * torch.randn((3, self.app_n_comp + self.density_n_comp, res, 1), device=device))
-        self.basis_mat = torch.nn.Linear(self.app_n_comp * 3, self.app_dim, bias=False, device=device)
+        self.density_plane, self.density_line = self.init_one_svd(self.density_n_comp, self.gridSize, 0.1, device)
+        self.app_plane, self.app_line = self.init_one_svd(self.app_n_comp, self.gridSize, 0.1, device)
+        self.basis_mat = torch.nn.Linear(sum(self.app_n_comp), self.app_dim, bias=False).to(device)
 
+    def get_aabb(self, device):
+        # from TensoRF/dataLoader/blender.py
+        scene_bbox = torch.tensor([[-1.5, -1.5, -1.5], [1.5, 1.5, 1.5]])
+        aabb = scene_bbox.to(device)
+
+    def get_gridSize(self, device, aabb):
+        # from TensoRF/configs/lego.txt
+        N_voxel_init = 2097156 # 128**3
+        # from TensoRF/train.py
+        reso_cur = self.N_to_reso(N_voxel_init, aabb)
+
+    # from TensoRF/utils.py
+    def N_to_reso(n_voxels, bbox):
+        xyz_min, xyz_max = bbox
+        voxel_size = ((xyz_max - xyz_min).prod() / n_voxels).pow(1 / 3)
+        return ((xyz_max - xyz_min) / voxel_size).long().tolist()
 
 def hsv_to_rgb(h, s, v):
     '''
