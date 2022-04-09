@@ -140,7 +140,7 @@ class NeRF:
         return model
 
 class NeRFOriginal(nn.Module):
-    def __init__(self, aabb, gridSize, device, D=8, W=256, input_ch=3, input_ch_views=3, input_ch_time=1, output_ch=4, skips=[4],
+    def __init__(self, device, D=8, W=256, input_ch=3, input_ch_views=3, input_ch_time=1, output_ch=4, skips=[4],
                  use_viewdirs=False, memory=[], embed_fn=None, output_color_ch=3, zero_canonical=True):
         super(NeRFOriginal, self).__init__()
         # aabb, gridSize, device
@@ -192,6 +192,9 @@ class NeRFOriginal(nn.Module):
 
         self.matMode = [[0,1], [0,2], [1,2]]
         self.vecMode =  [2, 1, 0]
+
+        aabb = self.get_aabb(device)
+        gridSize = self.get_gridSize(device, aabb)
 
         self.init_svd_volume(gridSize[0], device)
 
