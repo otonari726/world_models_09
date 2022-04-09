@@ -186,9 +186,10 @@ class NeRFOriginal(nn.Module):
 
         # from TensoRF
         self.fea2denseAct = 'softplus'
-        self.density_n_comp = 8
-        self.app_n_comp = 24
-        self.app_dim = 27
+        self.density_shift = -10
+        self.density_n_comp = [16,16,16] # ref. n_lamb_sigma
+        self.app_n_comp = [48,48,48] # ref. n_lamb_sh
+        self.app_dim = 27 # ref. data_dim_color
 
         self.matMode = [[0,1], [0,2], [1,2]]
         self.vecMode =  [2, 1, 0]
@@ -214,6 +215,7 @@ class NeRFOriginal(nn.Module):
         # else:
         #     xyz_sampled, z_vals, ray_valid = self.sample_ray(rays_chunk[:, :3], viewdirs, is_train=is_train,N_samples=N_samples)
         #     dists = torch.cat((z_vals[:, 1:] - z_vals[:, :-1], torch.zeros_like(z_vals[:, :1])), dim=-1)
+        import pdb;pdb.set_trace()
         viewdirs = viewdirs.view(-1, 1, 3).expand(xyz_sampled.shape)
 
         sigma = torch.zeros(xyz_sampled.shape[:-1], device=xyz_sampled.device)
