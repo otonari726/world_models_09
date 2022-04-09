@@ -143,6 +143,7 @@ class NeRFOriginal(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, input_ch_time=1, output_ch=4, skips=[4],
                  use_viewdirs=False, memory=[], embed_fn=None, output_color_ch=3, zero_canonical=True):
         super(NeRFOriginal, self).__init__()
+        # aabb, gridSize, device
         self.D = D
         self.W = W
         self.input_ch = input_ch
@@ -183,28 +184,70 @@ class NeRFOriginal(nn.Module):
         else:
             self.output_linear = nn.Linear(W, output_ch)
 
+        # from TensoRF
+        self.fea2denseAct = 'softplus'
+        self.density_n_comp = 8
+        self.app_n_comp = 24
+        self.app_dim = 27
+
+        self.matMode = [[0,1], [0,2], [1,2]]
+        self.vecMode =  [2, 1, 0]
+
+        self.init_svd_volume(gridSize[0], device)
+
     def forward(self, x, ts):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
-        h = input_pts
-        for i, l in enumerate(self.pts_linears):
-            h = self.pts_linears[i](h)
-            h = F.relu(h)
-            if i in self.skips:
-                h = torch.cat([input_pts, h], -1)
+        #h = input_pts
+        xyz_sampled = input_pts[:,27]
+        viewdirs = input_views
 
-        if self.use_viewdirs:
-            alpha = self.alpha_linear(h)
-            feature = self.feature_linear(h)
-            h = torch.cat([feature, input_views], -1)
+        ndc_ray = True # TODO : think deeply
+        if ndc_ray:
+            #xyz_sampled, z_vals, ray_valid = self.sample_ray_ndc(rays_chunk[:, :3], viewdirs, is_train=is_train,N_samples=N_samples)
+            #dists = torch.cat((z_vals[:, 1:] - z_vals[:, :-1], torch.zeros_like(z_vals[:, :1])), dim=-1)
+            rays_norm = torch.norm(viewdirs, dim=-1, keepdim=True)
+            #dists = dists * rays_norm
+            viewdirs = viewdirs / rays_norm
+        # else:
+        #     xyz_sampled, z_vals, ray_valid = self.sample_ray(rays_chunk[:, :3], viewdirs, is_train=is_train,N_samples=N_samples)
+        #     dists = torch.cat((z_vals[:, 1:] - z_vals[:, :-1], torch.zeros_like(z_vals[:, :1])), dim=-1)
+        viewdirs = viewdirs.view(-1, 1, 3).expand(xyz_sampled.shape)
 
-            for i, l in enumerate(self.views_linears):
-                h = self.views_linears[i](h)
-                h = F.relu(h)
+        sigma = torch.zeros(xyz_sampled.shape[:-1], device=xyz_sampled.device)
+        rgb = torch.zeros((*xyz_sampled.shape[:2], 3), device=xyz_sampled.device)
 
-            rgb = self.rgb_linear(h)
-            outputs = torch.cat([rgb, alpha], -1)
-        else:
-            outputs = self.output_linear(h)
+        # if ray_valid.any():
+        xyz_sampled = self.normalize_coord(xyz_sampled)
+        sigma_feature = self.compute_densityfeature(xyz_sampled)
+
+        validsigma = self.feature2density(sigma_feature)
+        sigma = validsigma
+
+        #if app_mask.any():
+        #app_features = self.compute_appfeature(xyz_sampled)
+        #valid_rgbs = self.renderModule(xyz_sampled, viewdirs, app_features)
+        #rgb = valid_rgbs
+
+        # for i, l in enumerate(self.pts_linears):
+        #     h = self.pts_linears[i](h)
+        #     h = F.relu(h)
+        #     if i in self.skips:
+        #         h = torch.cat([input_pts, h], -1)
+
+        # if self.use_viewdirs:
+        #     alpha = self.alpha_linear(h)
+        #     feature = self.feature_linear(h)
+        #     h = torch.cat([feature, input_views], -1)
+
+        #     for i, l in enumerate(self.views_linears):
+        #         h = self.views_linears[i](h)
+        #         h = F.relu(h)
+
+        #     rgb = self.rgb_linear(h)
+        #     outputs = torch.cat([rgb, alpha], -1)
+        # else:
+        #     outputs = self.output_linear(h)
+        outputs = torch.cat([rgb, sigma], -1)
 
         return outputs, torch.zeros_like(input_pts[:, :3])
 
@@ -236,6 +279,39 @@ class NeRFOriginal(nn.Module):
         idx_alpha_linear = 2 * self.D + 6
         self.alpha_linear.weight.data = torch.from_numpy(np.transpose(weights[idx_alpha_linear]))
         self.alpha_linear.bias.data = torch.from_numpy(np.transpose(weights[idx_alpha_linear+1]))
+
+    # from TensoRF
+    def normalize_coord(self, xyz_sampled):
+        return (xyz_sampled-self.aabb[0]) * self.invaabbSize - 1
+
+    def feature2density(self, density_features):
+        if self.fea2denseAct == "softplus":
+            return F.softplus(density_features+self.density_shift)
+        elif self.fea2denseAct == "relu":
+            return F.relu(density_features)
+
+    # from tensoRF.py VM
+    def compute_densityfeature(self, xyz_sampled):
+        coordinate_plane = torch.stack((xyz_sampled[..., self.matMode[0]], xyz_sampled[..., self.matMode[1]], xyz_sampled[..., self.matMode[2]])).detach().view(3, -1, 1, 2)
+        coordinate_line = torch.stack((xyz_sampled[..., self.vecMode[0]], xyz_sampled[..., self.vecMode[1]], xyz_sampled[..., self.vecMode[2]]))
+        coordinate_line = torch.stack((torch.zeros_like(coordinate_line), coordinate_line), dim=-1).detach().view(3, -1, 1, 2)
+
+        plane_feats = F.grid_sample(self.plane_coef[:, -self.density_n_comp:], coordinate_plane, align_corners=True).view(
+                                        -1, *xyz_sampled.shape[:1])
+        line_feats = F.grid_sample(self.line_coef[:, -self.density_n_comp:], coordinate_line, align_corners=True).view(
+                                        -1, *xyz_sampled.shape[:1])
+        
+        sigma_feature = torch.sum(plane_feats * line_feats, dim=0)
+        
+        
+        return sigma_feature
+
+    def init_svd_volume(self, res, device):
+        self.plane_coef = torch.nn.Parameter(
+            0.1 * torch.randn((3, self.app_n_comp + self.density_n_comp, res, res), device=device))
+        self.line_coef = torch.nn.Parameter(
+            0.1 * torch.randn((3, self.app_n_comp + self.density_n_comp, res, 1), device=device))
+        self.basis_mat = torch.nn.Linear(self.app_n_comp * 3, self.app_dim, bias=False, device=device)
 
 
 def hsv_to_rgb(h, s, v):
@@ -346,3 +422,13 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
 
     return samples
+
+# from TensoRF
+def raw2alpha(sigma, dist):
+    # sigma, dist  [N_rays, N_samples]
+    alpha = 1. - torch.exp(-sigma*dist)
+
+    T = torch.cumprod(torch.cat([torch.ones(alpha.shape[0], 1).to(alpha.device), 1. - alpha + 1e-10], -1), -1)
+
+    weights = alpha * T[:, :-1]  # [N_rays, N_samples]
+    return alpha, weights, T[:,-1:]
