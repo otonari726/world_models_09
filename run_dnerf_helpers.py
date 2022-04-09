@@ -266,6 +266,8 @@ class NeRFOriginal(nn.Module):
         sigma = torch.unsqueeze(sigma, 1)
 
         app_features = self.compute_appfeature(xyz_sampled)
+        xyz_sampled = torch.squeeze(xyz_sampled, 1)
+        viewdirs = torch.squeeze(viewdirs, 1)
         valid_rgbs = self.renderModule(xyz_sampled, viewdirs, app_features)
         rgb = valid_rgbs
 
@@ -319,6 +321,7 @@ class NeRFOriginal(nn.Module):
         #     outputs = self.output_linear(h)
         outputs = torch.cat([rgb, sigma], -1)
 
+        input_pts, _ = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
         return outputs, torch.zeros_like(input_pts[:, :3])
 
     def load_weights_from_keras(self, weights):
