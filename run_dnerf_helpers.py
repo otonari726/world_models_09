@@ -110,6 +110,7 @@ class DirectTemporalNeRF(nn.Module):
 
         return net_final(h)
 
+    # Add
     def forward(self, x, ts, unpe_x):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
         t = ts[0]
@@ -138,6 +139,43 @@ class NeRF:
         else:
             raise ValueError("Type %s not recognized." % type)
         return model
+
+# Add
+def positional_encoding(positions, freqs):
+
+        freq_bands = (2**torch.arange(freqs).float()).to(positions.device)  # (F,)
+        pts = (positions[..., None] * freq_bands).reshape(
+            positions.shape[:-1] + (freqs * positions.shape[-1], ))  # (..., DF)
+        pts = torch.cat([torch.sin(pts), torch.cos(pts)], dim=-1)
+        return pts
+
+# Add
+class MLPRender_Fea(torch.nn.Module):
+    def __init__(self,inChanel, viewpe=6, feape=6, featureC=128):
+        super(MLPRender_Fea, self).__init__()
+
+        self.in_mlpC = 2*viewpe*3 + 2*feape*inChanel + 3 + inChanel
+        self.viewpe = viewpe
+        self.feape = feape
+        layer1 = torch.nn.Linear(self.in_mlpC, featureC)
+        layer2 = torch.nn.Linear(featureC, featureC)
+        layer3 = torch.nn.Linear(featureC,3)
+
+        self.mlp = torch.nn.Sequential(layer1, torch.nn.ReLU(inplace=True), layer2, torch.nn.ReLU(inplace=True), layer3)
+        torch.nn.init.constant_(self.mlp[-1].bias, 0)
+
+    def forward(self, pts, viewdirs, features):
+        indata = [features, viewdirs]
+        if self.feape > 0:
+            indata += [positional_encoding(features, self.feape)]
+        if self.viewpe > 0:
+            indata += [positional_encoding(viewdirs, self.viewpe)]
+        mlp_in = torch.cat(indata, dim=-1)
+        rgb = self.mlp(mlp_in)
+        rgb = torch.sigmoid(rgb)
+
+        return rgb
+
 
 class NeRFOriginal(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, input_ch_time=1, output_ch=4, skips=[4],
@@ -183,33 +221,115 @@ class NeRFOriginal(nn.Module):
         else:
             self.output_linear = nn.Linear(W, output_ch)
 
+        # Add
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        aabb = self.get_aabb(device)
+        self.gridSize = self.get_gridSize(device, aabb)
+
+        # Add
+        self.fea2denseAct = 'softplus'
+        self.density_shift = -10
+        self.matMode = [[0,1], [0,2], [1,2]]
+        self.vecMode =  [2, 1, 0]
+        self.density_n_comp = [16,16,16] # ref. n_lamb_sigma
+        self.app_n_comp = [48,48,48] # ref. n_lamb_sh
+        self.app_dim = 27 # ref. data_dim_color
+        # self.gridSizeがわからない
+        self.density_plane, self.density_line = self.init_one_svd(self.density_n_comp, self.gridSize, 0.1, device)
+        self.app_plane, self.app_line = self.init_one_svd(self.app_n_comp, self.gridSize, 0.1, device)
+        self.basis_mat = torch.nn.Linear(sum(self.app_n_comp), self.app_dim, bias=False).to(device)
+
+        view_pe = 6
+        fea_pe = 6
+        featureC=128
+        self.renderModule = MLPRender_Fea(self.app_dim, view_pe, fea_pe, featureC).to(device)
+
+    # Add
+    def get_aabb(self, device):
+        # from TensoRF/dataLoader/blender.py
+        scene_bbox = torch.tensor([[-1.5, -1.5, -1.5], [1.5, 1.5, 1.5]])
+        aabb = scene_bbox.to(device)
+        return aabb
+
+    # Add
+    def get_gridSize(self, device, aabb):
+        # from TensoRF/configs/lego.txt
+        N_voxel_init = 2097156 # 128**3
+        # from TensoRF/train.py
+        reso_cur = self.N_to_reso(N_voxel_init, aabb)
+        return reso_cur
+
+    # Add
+    # from TensoRF/utils.py
+    def N_to_reso(self, n_voxels, bbox):
+        xyz_min, xyz_max = bbox
+        voxel_size = ((xyz_max - xyz_min).prod() / n_voxels).pow(1 / 3)
+        return ((xyz_max - xyz_min) / voxel_size).long().tolist()
+
+
+    # Add
+    def init_one_svd(self, n_component, gridSize, scale, device):
+        plane_coef, line_coef = [], []
+        for i in range(len(self.vecMode)):
+            vec_id = self.vecMode[i]
+            mat_id_0, mat_id_1 = self.matMode[i]
+            plane_coef.append(torch.nn.Parameter(
+                scale * torch.randn((1, n_component[i], gridSize[mat_id_1], gridSize[mat_id_0]))))  #
+            line_coef.append(
+                torch.nn.Parameter(scale * torch.randn((1, n_component[i], gridSize[vec_id], 1))))
+
+        return torch.nn.ParameterList(plane_coef).to(device), torch.nn.ParameterList(line_coef).to(device)
+
+    # Add
     def forward(self, x, ts, unpe_x):
         # unpe_x: un-positional encoding (pos and viewdirs)
         # x.shape = [32000, 90]
-        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
-        # print(torch.unsqueeze(x, 1).shape)
+        # input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
+        xyz_sampled, viewdirs = torch.split(unpe_x, [3, 3], dim=-1)
+        xyz_sampled = torch.unsqueeze(xyz_sampled, 1)
+        viewdirs = torch.unsqueeze(viewdirs, 1)
+        # xyz_sampled.shape = torch.Size([32000, 1, 3]), viewdirs.shape = torch.Size([32000, 1, 3])
         # input_pts.shape = torch.Size([32000, 63]), input_views.shape = torch.Size([32000, 27])
         # DNeRF.input_pts == TensoRF.xyz_sampled, DNeRF.input_views == TensoRF.viewdirs
-        h = input_pts
-        for i, l in enumerate(self.pts_linears):
-            h = self.pts_linears[i](h)
-            h = F.relu(h)
-            if i in self.skips:
-                h = torch.cat([input_pts, h], -1)
 
-        if self.use_viewdirs:
-            alpha = self.alpha_linear(h)
-            feature = self.feature_linear(h)
-            h = torch.cat([feature, input_views], -1)
+        sigma = torch.zeros(xyz_sampled.shape[:-1], device=xyz_sampled.device)
+        rgb = torch.zeros((*xyz_sampled.shape[:2], 3), device=xyz_sampled.device)
+        # sigma.shape = torch.Size([32000, 1]), rgb.shape = torch.Size([32000, 1, 3])
 
-            for i, l in enumerate(self.views_linears):
-                h = self.views_linears[i](h)
-                h = F.relu(h)
+        # xyz_sampled = self.normalize_coord(xyz_sampled)
+        sigma_feature = self.compute_densityfeature(xyz_sampled)
+        # sigma_feature.shape = torch.Size([32000])
+        validsigma = self.feature2density(sigma_feature)
+        # validsigma.shape = torch.Size([32000])
+        sigma = validsigma
+        sigma = torch.unsqueeze(sigma, 1)
 
-            rgb = self.rgb_linear(h)
-            outputs = torch.cat([rgb, alpha], -1)
-        else:
-            outputs = self.output_linear(h)
+        app_features = self.compute_appfeature(xyz_sampled)
+        valid_rgbs = self.renderModule(xyz_sampled, viewdirs, app_features)
+        rgb = valid_rgbs
+
+        outputs = torch.cat([rgb, sigma], -1)
+
+        # h = input_pts
+        # for i, l in enumerate(self.pts_linears):
+        #     h = self.pts_linears[i](h)
+        #     h = F.relu(h)
+        #     if i in self.skips:
+        #         h = torch.cat([input_pts, h], -1)
+
+        # if self.use_viewdirs:
+        #     alpha = self.alpha_linear(h)
+        #     feature = self.feature_linear(h)
+        #     h = torch.cat([feature, input_views], -1)
+
+        #     for i, l in enumerate(self.views_linears):
+        #         h = self.views_linears[i](h)
+        #         h = F.relu(h)
+
+        #     rgb = self.rgb_linear(h)
+        #     outputs = torch.cat([rgb, alpha], -1)
+        # else:
+        #     outputs = self.output_linear(h)
 
         return outputs, torch.zeros_like(input_pts[:, :3])
 
@@ -242,20 +362,54 @@ class NeRFOriginal(nn.Module):
         self.alpha_linear.weight.data = torch.from_numpy(np.transpose(weights[idx_alpha_linear]))
         self.alpha_linear.bias.data = torch.from_numpy(np.transpose(weights[idx_alpha_linear+1]))
 
-    # ADD
+    # Add
     def compute_densityfeature(self, xyz_sampled):
+        # self.matMode, self.vecMode, self.density_plane, self.density_line
+
+        # plane + line basis
         coordinate_plane = torch.stack((xyz_sampled[..., self.matMode[0]], xyz_sampled[..., self.matMode[1]], xyz_sampled[..., self.matMode[2]])).detach().view(3, -1, 1, 2)
         coordinate_line = torch.stack((xyz_sampled[..., self.vecMode[0]], xyz_sampled[..., self.vecMode[1]], xyz_sampled[..., self.vecMode[2]]))
         coordinate_line = torch.stack((torch.zeros_like(coordinate_line), coordinate_line), dim=-1).detach().view(3, -1, 1, 2)
 
-        plane_feats = F.grid_sample(self.plane_coef[:, -self.density_n_comp:], coordinate_plane, align_corners=True).view(
-                                        -1, *xyz_sampled.shape[:1])
-        line_feats = F.grid_sample(self.line_coef[:, -self.density_n_comp:], coordinate_line, align_corners=True).view(
-                                        -1, *xyz_sampled.shape[:1])
-
-        sigma_feature = torch.sum(plane_feats * line_feats, dim=0)
+        sigma_feature = torch.zeros((xyz_sampled.shape[0],), device=xyz_sampled.device)
+        for idx_plane in range(len(self.density_plane)):
+            plane_coef_point = F.grid_sample(self.density_plane[idx_plane], coordinate_plane[[idx_plane]],
+                                                align_corners=True).view(-1, *xyz_sampled.shape[:1])
+            line_coef_point = F.grid_sample(self.density_line[idx_plane], coordinate_line[[idx_plane]],
+                                            align_corners=True).view(-1, *xyz_sampled.shape[:1])
+            sigma_feature = sigma_feature + torch.sum(plane_coef_point * line_coef_point, dim=0)
 
         return sigma_feature
+
+    # Add
+    def feature2density(self, density_features):
+        # self.fea2denseAct, self.density_shift
+
+        if self.fea2denseAct == "softplus":
+            return F.softplus(density_features+self.density_shift)
+        elif self.fea2denseAct == "relu":
+            return F.relu(density_features)
+
+    # Add
+    def compute_appfeature(self, xyz_sampled):
+        # self.matMode, self.vecMode, self.app_plane, self.app_line, self.basis_mat
+
+        # plane + line basis
+        coordinate_plane = torch.stack((xyz_sampled[..., self.matMode[0]], xyz_sampled[..., self.matMode[1]], xyz_sampled[..., self.matMode[2]])).detach().view(3, -1, 1, 2)
+        coordinate_line = torch.stack((xyz_sampled[..., self.vecMode[0]], xyz_sampled[..., self.vecMode[1]], xyz_sampled[..., self.vecMode[2]]))
+        coordinate_line = torch.stack((torch.zeros_like(coordinate_line), coordinate_line), dim=-1).detach().view(3, -1, 1, 2)
+
+        plane_coef_point,line_coef_point = [],[]
+        for idx_plane in range(len(self.app_plane)):
+            plane_coef_point.append(F.grid_sample(self.app_plane[idx_plane], coordinate_plane[[idx_plane]],
+                                                align_corners=True).view(-1, *xyz_sampled.shape[:1]))
+            line_coef_point.append(F.grid_sample(self.app_line[idx_plane], coordinate_line[[idx_plane]],
+                                            align_corners=True).view(-1, *xyz_sampled.shape[:1]))
+        plane_coef_point, line_coef_point = torch.cat(plane_coef_point), torch.cat(line_coef_point)
+
+
+        return self.basis_mat((plane_coef_point * line_coef_point).T)
+
 
 
 def hsv_to_rgb(h, s, v):
