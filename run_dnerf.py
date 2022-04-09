@@ -214,7 +214,7 @@ def create_nerf(args):
 
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
-    model = NeRF.get_by_name(device, args.nerf_type, D=args.netdepth, W=args.netwidth,
+    model = NeRF.get_by_name(args.nerf_type, device=device, D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, input_ch_time=input_ch_time,
                  use_viewdirs=args.use_viewdirs, embed_fn=embed_fn,
@@ -223,7 +223,7 @@ def create_nerf(args):
 
     model_fine = None
     if args.use_two_models_for_fine:
-        model_fine = NeRF.get_by_name(device, args.nerf_type, D=args.netdepth_fine, W=args.netwidth_fine,
+        model_fine = NeRF.get_by_name(args.nerf_type, device, D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
                           input_ch_views=input_ch_views, input_ch_time=input_ch_time,
                           use_viewdirs=args.use_viewdirs, embed_fn=embed_fn,

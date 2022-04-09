@@ -66,7 +66,7 @@ def get_embedder(multires, input_dims, i=0):
 
 # Model
 class DirectTemporalNeRF(nn.Module):
-    def __init__(self, sevice, D=8, W=256, input_ch=3, input_ch_views=3, input_ch_time=1, output_ch=4, skips=[4],
+    def __init__(self, device, D=8, W=256, input_ch=3, input_ch_views=3, input_ch_time=1, output_ch=4, skips=[4],
                  use_viewdirs=False, memory=[], embed_fn=None, zero_canonical=True):
         super(DirectTemporalNeRF, self).__init__()
         self.D = D
@@ -194,9 +194,9 @@ class NeRFOriginal(nn.Module):
         self.vecMode =  [2, 1, 0]
 
         aabb = self.get_aabb(device)
-        gridSize = self.get_gridSize(device, aabb)
+        self.gridSize = self.get_gridSize(device, aabb)
 
-        self.init_svd_volume(gridSize[0], device)
+        self.init_svd_volume(self.gridSize[0], device)
 
     def forward(self, x, ts):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
@@ -316,19 +316,33 @@ class NeRFOriginal(nn.Module):
         self.app_plane, self.app_line = self.init_one_svd(self.app_n_comp, self.gridSize, 0.1, device)
         self.basis_mat = torch.nn.Linear(sum(self.app_n_comp), self.app_dim, bias=False).to(device)
 
+    def init_one_svd(self, n_component, gridSize, scale, device):
+        plane_coef, line_coef = [], []
+        for i in range(len(self.vecMode)):
+            vec_id = self.vecMode[i]
+            mat_id_0, mat_id_1 = self.matMode[i]
+            plane_coef.append(torch.nn.Parameter(
+                scale * torch.randn((1, n_component[i], gridSize[mat_id_1], gridSize[mat_id_0]))))  #
+            line_coef.append(
+                torch.nn.Parameter(scale * torch.randn((1, n_component[i], gridSize[vec_id], 1))))
+
+        return torch.nn.ParameterList(plane_coef).to(device), torch.nn.ParameterList(line_coef).to(device)
+
     def get_aabb(self, device):
         # from TensoRF/dataLoader/blender.py
         scene_bbox = torch.tensor([[-1.5, -1.5, -1.5], [1.5, 1.5, 1.5]])
         aabb = scene_bbox.to(device)
+        return aabb
 
     def get_gridSize(self, device, aabb):
         # from TensoRF/configs/lego.txt
         N_voxel_init = 2097156 # 128**3
         # from TensoRF/train.py
         reso_cur = self.N_to_reso(N_voxel_init, aabb)
+        return reso_cur
 
     # from TensoRF/utils.py
-    def N_to_reso(n_voxels, bbox):
+    def N_to_reso(self, n_voxels, bbox):
         xyz_min, xyz_max = bbox
         voxel_size = ((xyz_max - xyz_min).prod() / n_voxels).pow(1 / 3)
         return ((xyz_max - xyz_min) / voxel_size).long().tolist()
