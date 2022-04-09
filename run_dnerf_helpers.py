@@ -66,7 +66,7 @@ def get_embedder(multires, input_dims, i=0):
 
 # Model
 class DirectTemporalNeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, input_ch_time=1, output_ch=4, skips=[4],
+    def __init__(self, sevice, D=8, W=256, input_ch=3, input_ch_views=3, input_ch_time=1, output_ch=4, skips=[4],
                  use_viewdirs=False, memory=[], embed_fn=None, zero_canonical=True):
         super(DirectTemporalNeRF, self).__init__()
         self.D = D
@@ -80,7 +80,7 @@ class DirectTemporalNeRF(nn.Module):
         self.embed_fn = embed_fn
         self.zero_canonical = zero_canonical
 
-        self._occ = NeRFOriginal(D=D, W=W, input_ch=input_ch, input_ch_views=input_ch_views,
+        self._occ = NeRFOriginal(device, D=D, W=W, input_ch=input_ch, input_ch_views=input_ch_views,
                                  input_ch_time=input_ch_time, output_ch=output_ch, skips=skips,
                                  use_viewdirs=use_viewdirs, memory=memory, embed_fn=embed_fn, output_color_ch=3)
         self._time, self._time_out = self.create_time_net()
@@ -128,13 +128,13 @@ class DirectTemporalNeRF(nn.Module):
 
 class NeRF:
     @staticmethod
-    def get_by_name(type,  *args, **kwargs):
+    def get_by_name(type, device, *args, **kwargs):
         print ("NeRF type selected: %s" % type)
 
         if type == "original":
-            model = NeRFOriginal(*args, **kwargs)
+            model = NeRFOriginal(device, *args, **kwargs)
         elif type == "direct_temporal":
-            model = DirectTemporalNeRF(*args, **kwargs)
+            model = DirectTemporalNeRF(device, *args, **kwargs)
         else:
             raise ValueError("Type %s not recognized." % type)
         return model
