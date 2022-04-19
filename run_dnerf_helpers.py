@@ -119,13 +119,14 @@ class DirectTemporalNeRF(nn.Module):
         cur_time = t[0, 0]
         if cur_time == 0. and self.zero_canonical:
             dx = torch.zeros_like(input_pts[:, :3])
+            unpe_x1 = unpe_x
         else:
             dx = self.query_time(input_pts, t, self._time, self._time_out)
             input_pts_orig = input_pts[:, :3]
+            unpe_x1 = torch.cat([input_pts_orig+dx, input_views[:, :3]], dim=-1)
             input_pts = self.embed_fn(input_pts_orig + dx)
-        out, _ = self._occ(torch.cat([input_pts, input_views], dim=-1), t, unpe_x)
+        out, _ = self._occ(torch.cat([input_pts, input_views], dim=-1), t, unpe_x1)
         return out, dx
-
 
 class NeRF:
     @staticmethod
@@ -178,10 +179,9 @@ class MLPRender_Fea(torch.nn.Module):
 
 
 class NeRFOriginal(nn.Module):
-    def __init__(self, device, D=8, W=256, input_ch=3, input_ch_views=3, input_ch_time=1, output_ch=4, skips=[4],
+    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, input_ch_time=1, output_ch=4, skips=[4],
                  use_viewdirs=False, memory=[], embed_fn=None, output_color_ch=3, zero_canonical=True):
         super(NeRFOriginal, self).__init__()
-        # aabb, gridSize, device
         self.D = D
         self.W = W
         self.input_ch = input_ch
@@ -223,6 +223,8 @@ class NeRFOriginal(nn.Module):
             self.output_linear = nn.Linear(W, output_ch)
 
         # from TensoRF
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.fea2denseAct = 'softplus'
         self.density_shift = -10
         self.density_n_comp = [16,16,16] # ref. n_lamb_sigma
@@ -241,6 +243,7 @@ class NeRFOriginal(nn.Module):
         fea_pe = 6
         featureC=128
         self.renderModule = MLPRender_Fea(self.app_dim, view_pe, fea_pe, featureC).to(device)
+
 
     def forward(self, x, ts, unpe_x):
         # unpe_x: un-positional encoding (pos and viewdirs)
@@ -324,6 +327,31 @@ class NeRFOriginal(nn.Module):
         input_pts, _ = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
         return outputs, torch.zeros_like(input_pts[:, :3])
 
+        # input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
+        # h = input_pts
+        # for i, l in enumerate(self.pts_linears):
+        #     h = self.pts_linears[i](h)
+        #     h = F.relu(h)
+        #     if i in self.skips:
+        #         h = torch.cat([input_pts, h], -1)
+
+        # if self.use_viewdirs:
+        #     alpha = self.alpha_linear(h)
+        #     feature = self.feature_linear(h)
+        #     h = torch.cat([feature, input_views], -1)
+
+        #     for i, l in enumerate(self.views_linears):
+        #         h = self.views_linears[i](h)
+        #         h = F.relu(h)
+
+        #     rgb = self.rgb_linear(h)
+        #     outputs = torch.cat([rgb, alpha], -1)
+        # else:
+        #     outputs = self.output_linear(h)
+
+        # return outputs, torch.zeros_like(input_pts[:, :3])
+
+
     def load_weights_from_keras(self, weights):
         assert self.use_viewdirs, "Not implemented if use_viewdirs=False"
 
@@ -368,9 +396,9 @@ class NeRFOriginal(nn.Module):
         # self.matMode, self.vecMode, self.density_plane, self.density_line
 
         # plane + line basis
-        coordinate_plane = torch.stack((xyz_sampled[..., self.matMode[0]], xyz_sampled[..., self.matMode[1]], xyz_sampled[..., self.matMode[2]])).detach().view(3, -1, 1, 2)
+        coordinate_plane = torch.stack((xyz_sampled[..., self.matMode[0]], xyz_sampled[..., self.matMode[1]], xyz_sampled[..., self.matMode[2]])).view(3, -1, 1, 2)
         coordinate_line = torch.stack((xyz_sampled[..., self.vecMode[0]], xyz_sampled[..., self.vecMode[1]], xyz_sampled[..., self.vecMode[2]]))
-        coordinate_line = torch.stack((torch.zeros_like(coordinate_line), coordinate_line), dim=-1).detach().view(3, -1, 1, 2)
+        coordinate_line = torch.stack((torch.zeros_like(coordinate_line), coordinate_line), dim=-1).view(3, -1, 1, 2)
 
         sigma_feature = torch.zeros((xyz_sampled.shape[0],), device=xyz_sampled.device)
         for idx_plane in range(len(self.density_plane)):
@@ -378,6 +406,7 @@ class NeRFOriginal(nn.Module):
                                                 align_corners=True).view(-1, *xyz_sampled.shape[:1])
             line_coef_point = F.grid_sample(self.density_line[idx_plane], coordinate_line[[idx_plane]],
                                             align_corners=True).view(-1, *xyz_sampled.shape[:1])
+            # 怪しい
             sigma_feature = sigma_feature + torch.sum(plane_coef_point * line_coef_point, dim=0)
 
         return sigma_feature
@@ -419,22 +448,13 @@ class NeRFOriginal(nn.Module):
         return ((xyz_max - xyz_min) / voxel_size).long().tolist()
 
     # Add
-    def feature2density(self, density_features):
-        # self.fea2denseAct, self.density_shift
-
-        if self.fea2denseAct == "softplus":
-            return F.softplus(density_features+self.density_shift)
-        elif self.fea2denseAct == "relu":
-            return F.relu(density_features)
-
-    # Add
     def compute_appfeature(self, xyz_sampled):
         # self.matMode, self.vecMode, self.app_plane, self.app_line, self.basis_mat
 
         # plane + line basis
-        coordinate_plane = torch.stack((xyz_sampled[..., self.matMode[0]], xyz_sampled[..., self.matMode[1]], xyz_sampled[..., self.matMode[2]])).detach().view(3, -1, 1, 2)
+        coordinate_plane = torch.stack((xyz_sampled[..., self.matMode[0]], xyz_sampled[..., self.matMode[1]], xyz_sampled[..., self.matMode[2]])).view(3, -1, 1, 2)
         coordinate_line = torch.stack((xyz_sampled[..., self.vecMode[0]], xyz_sampled[..., self.vecMode[1]], xyz_sampled[..., self.vecMode[2]]))
-        coordinate_line = torch.stack((torch.zeros_like(coordinate_line), coordinate_line), dim=-1).detach().view(3, -1, 1, 2)
+        coordinate_line = torch.stack((torch.zeros_like(coordinate_line), coordinate_line), dim=-1).view(3, -1, 1, 2)
 
         plane_coef_point,line_coef_point = [],[]
         for idx_plane in range(len(self.app_plane)):
